@@ -5,6 +5,13 @@ import gspread
 from google.oauth2.service_account import Credentials
 import flet as ft
 import json
+import time
+from datetime import datetime
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION LOADER ---
 def load_config():
@@ -27,6 +34,7 @@ SPREADSHEET_NAME = CONFIG["google_sheets"]["spreadsheet_name"]
 NOTION_ID_COLUMN = CONFIG["google_sheets"].get("notion_id_column", "Notion Page ID")
 GOOGLE_CREDENTIALS_FILE = CONFIG["google_sheets"].get("credentials_file", "google-credentials.json")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+RATE_LIMIT_DELAY = CONFIG.get("rate_limit_delay", 0.1)  # Seconds between API calls
 
 # --- API CLIENT SETUP ---
 # Headers for Notion API
@@ -50,10 +58,12 @@ def show_snackbar(page: ft.Page, message: str, color: str = ft.Colors.GREEN):
 class Sync2Sheets:
     """Encapsulates all logic for syncing between Notion and Google Sheets."""
 
-    def __init__(self):
+    def __init__(self, progress_callback=None):
         self.gs_client = self._get_gs_client()
         self.sheet = self._get_sheet()
         self.notion_db_schema = self._fetch_notion_db_schema()
+        self.progress_callback = progress_callback
+        self.sync_stats = {"updated": 0, "created": 0, "errors": 0}
 
     def _get_gs_client(self):
         """Initializes and returns the gspread client."""
@@ -82,60 +92,76 @@ class Sync2Sheets:
         except requests.exceptions.RequestException as e:
             raise Exception(f"Failed to fetch Notion database schema: {e}")
 
+    def _update_progress(self, message: str):
+        """Update progress if callback is provided."""
+        if self.progress_callback:
+            self.progress_callback(message)
+        logger.info(message)
+
     def sync_notion_to_sheets(self):
         """
         Fetches all pages from the Notion database and intelligently updates or appends
-        them to the Google Sheet.
+        them to the Google Sheet using batch operations.
         """
-        # 1. Fetch all data from Notion
-        notion_pages = self._fetch_all_notion_pages()
-
-        # 2. Get current state of Google Sheet
-        sheet_data = self.sheet.get_all_records(head=1) # Get as a list of dictionaries
-        sheet_by_notion_id = {row[NOTION_ID_COLUMN]: row for row in sheet_data if NOTION_ID_COLUMN in row}
+        self.sync_stats = {"updated": 0, "created": 0, "errors": 0}
         
+        self._update_progress("Fetching Notion database pages...")
+        notion_pages = self._fetch_all_notion_pages()
+        
+        self._update_progress("Processing sheet data...")
         headers = list(self.notion_db_schema.keys()) + [NOTION_ID_COLUMN]
         
-        # Ensure sheet has the correct headers
-        if self.sheet.row_count < 1 or self.sheet.row_values(1) != headers:
-            self.sheet.clear()
-            self.sheet.append_row(headers)
-
-        updates = []
-        for page in notion_pages:
-            page_id = page['id']
-            row_data = self._format_notion_page_for_sheet(page, headers)
-
-            # Check if this page ID already exists in our sheet data
-            if page_id in sheet_by_notion_id:
-                # Update existing row if data differs (more efficient)
-                # This check can be expanded to be more granular
-                pass # For simplicity, we will just overwrite
-            
-            # For this simplified example, we'll just write all rows.
-            # A more advanced version would use gspread's batch_update for efficiency.
-            updates.append(row_data)
+        # Prepare batch data
+        batch_data = [headers]  # Start with headers
         
-        # Clear all but header and batch write
-        self.sheet.clear()
-        self.sheet.append_row(headers)
-        if updates:
-            self.sheet.append_rows(updates)
+        for i, page in enumerate(notion_pages):
+            try:
+                row_data = self._format_notion_page_for_sheet(page, headers)
+                batch_data.append(row_data)
+                
+                if (i + 1) % 10 == 0:  # Update progress every 10 pages
+                    self._update_progress(f"Processed {i + 1}/{len(notion_pages)} pages")
+                    
+            except Exception as e:
+                logger.error(f"Error processing page {page.get('id', 'unknown')}: {e}")
+                self.sync_stats["errors"] += 1
+        
+        # Batch update the sheet
+        self._update_progress("Updating Google Sheet...")
+        try:
+            self.sheet.clear()
+            if batch_data:
+                # Use batch update for better performance
+                self.sheet.update(range_name="A1", values=batch_data)
+            self.sync_stats["updated"] = len(notion_pages)
+        except Exception as e:
+            raise Exception(f"Failed to update Google Sheet: {e}")
 
     def _fetch_all_notion_pages(self):
-        """Fetches all pages from a Notion database, handling pagination."""
+        """Fetches all pages from a Notion database, handling pagination with rate limiting."""
         all_results = []
         url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query"
         payload = {}
         has_more = True
+        page_count = 0
         
         while has_more:
-            response = requests.post(url, headers=notion_headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            all_results.extend(data["results"])
-            has_more = data["has_more"]
-            payload["start_cursor"] = data.get("next_cursor")
+            try:
+                response = requests.post(url, headers=notion_headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                all_results.extend(data["results"])
+                has_more = data["has_more"]
+                payload["start_cursor"] = data.get("next_cursor")
+                page_count += len(data["results"])
+                
+                # Rate limiting
+                if RATE_LIMIT_DELAY > 0:
+                    time.sleep(RATE_LIMIT_DELAY)
+                    
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching Notion pages: {e}")
+                raise Exception(f"Failed to fetch Notion pages: {e}")
             
         return all_results
 
@@ -169,22 +195,31 @@ class Sync2Sheets:
         if prop_type == "checkbox":
             return "TRUE" if val else "FALSE"
         if prop_type == "date":
-            return val.get("start", "")
+            if isinstance(val, dict):
+                start_date = val.get("start", "")
+                end_date = val.get("end", "")
+                return f"{start_date}" + (f" to {end_date}" if end_date else "")
+            return str(val)
         if prop_type in ["url", "email", "phone_number"]:
             return val
         if prop_type == "formula":
             return self._extract_value_from_prop(val)
         if prop_type == "relation":
-            # For simplicity, we don't resolve relations here.
-            return f"{len(val)} relations"
+            return f"{len(val)} relations" if isinstance(val, list) else "0 relations"
         if prop_type == "people":
             return ", ".join(person.get('name', 'Unknown User') for person in val)
-        return str(val) # Fallback for unhandled types
+        if prop_type == "created_time" or prop_type == "last_edited_time":
+            return val[:10] if val else ""  # Extract date part
+        return str(val)[:100] + "..." if len(str(val)) > 100 else str(val)  # Truncate very long values
 
     def sync_sheets_to_notion(self):
         """
-        Reads rows from Google Sheets and creates or updates corresponding pages in Notion.
+        Reads rows from Google Sheets and creates or updates corresponding pages in Notion
+        with improved error handling and batch processing.
         """
+        self.sync_stats = {"updated": 0, "created": 0, "errors": 0}
+        
+        self._update_progress("Reading Google Sheet data...")
         rows = self.sheet.get_all_values()
         if not rows:
             raise Exception("Sheet is empty.")
@@ -195,77 +230,126 @@ class Sync2Sheets:
         if id_column_index == -1:
             raise Exception(f"'{NOTION_ID_COLUMN}' column not found in sheet.")
 
-        for row_index, row in enumerate(rows[1:], start=2):
-            properties = self._build_notion_properties_from_row(row, headers)
-            notion_page_id = row[id_column_index] if len(row) > id_column_index else None
-
+        data_rows = rows[1:]  # Skip header row
+        batch_updates = []  # For updating sheet with new page IDs
+        
+        for row_index, row in enumerate(data_rows, start=2):
             try:
+                self._update_progress(f"Processing row {row_index - 1}/{len(data_rows)}")
+                
+                properties = self._build_notion_properties_from_row(row, headers)
+                notion_page_id = row[id_column_index] if len(row) > id_column_index and row[id_column_index] else None
+
                 if notion_page_id:
                     # Update existing page
                     url = f"https://api.notion.com/v1/pages/{notion_page_id}"
                     payload = {"properties": properties}
                     response = requests.patch(url, headers=notion_headers, json=payload)
                     response.raise_for_status()
+                    self.sync_stats["updated"] += 1
                 else:
                     # Create new page
                     url = "https://api.notion.com/v1/pages"
                     payload = {"parent": {"database_id": NOTION_DB_ID}, "properties": properties}
                     response = requests.post(url, headers=notion_headers, json=payload)
                     response.raise_for_status()
-                    # Write the new page ID back to the sheet
+                    
+                    # Prepare batch update for new page ID
                     new_page_id = response.json()['id']
-                    self.sheet.update_cell(row_index, id_column_index + 1, new_page_id)
+                    batch_updates.append({
+                        'range': f'{chr(65 + id_column_index)}{row_index}',
+                        'values': [[new_page_id]]
+                    })
+                    self.sync_stats["created"] += 1
+                
+                # Rate limiting
+                if RATE_LIMIT_DELAY > 0:
+                    time.sleep(RATE_LIMIT_DELAY)
+                    
             except requests.exceptions.RequestException as e:
-                # Log error and continue with next row
                 error_text = e.response.text if hasattr(e, "response") and e.response is not None else str(e)
-                print(f"Failed to sync row {row_index} to Notion. Error: {error_text}")
-                continue # Don't let one bad row stop the whole sync
+                logger.error(f"Failed to sync row {row_index} to Notion. Error: {error_text}")
+                self.sync_stats["errors"] += 1
+                continue
+            except Exception as e:
+                logger.error(f"Unexpected error processing row {row_index}: {e}")
+                self.sync_stats["errors"] += 1
+                continue
+
+        # Batch update new page IDs
+        if batch_updates:
+            self._update_progress("Updating sheet with new page IDs...")
+            try:
+                for update in batch_updates:
+                    self.sheet.update(update['range'], update['values'])
+                    if RATE_LIMIT_DELAY > 0:
+                        time.sleep(RATE_LIMIT_DELAY)
+            except Exception as e:
+                logger.warning(f"Failed to update some page IDs in sheet: {e}")
 
     def _build_notion_properties_from_row(self, row, headers):
-        """Constructs a Notion API properties object from a sheet row."""
+        """Constructs a Notion API properties object from a sheet row with improved validation."""
         properties = {}
         for i, header in enumerate(headers):
             if header == NOTION_ID_COLUMN or i >= len(row):
                 continue
             
-            cell_value = row[i]
-            if header not in self.notion_db_schema:
-                continue # Skip columns in sheet that aren't in Notion DB
+            cell_value = row[i].strip() if i < len(row) else ""
+            if header not in self.notion_db_schema or not cell_value:
+                continue
                 
             prop_schema = self.notion_db_schema[header]
             prop_type = prop_schema['type']
             
-            # Based on the schema, construct the correct object structure
-            if prop_type == "title":
-                properties[header] = {"title": [{"text": {"content": cell_value}}]}
-            elif prop_type == "rich_text":
-                properties[header] = {"rich_text": [{"text": {"content": cell_value}}]}
-            elif prop_type == "number" and cell_value:
-                try:
-                    properties[header] = {"number": float(cell_value)}
-                except ValueError:
-                    properties[header] = {"number": None} # Or handle error
-            elif prop_type == "select" and cell_value:
-                properties[header] = {"select": {"name": cell_value}}
-            elif prop_type == "status" and cell_value:
-                properties[header] = {"status": {"name": cell_value}}
-            elif prop_type == "multi_select":
-                names = [name.strip() for name in cell_value.split(',') if name.strip()]
-                properties[header] = {"multi_select": [{"name": name} for name in names]}
-            elif prop_type == "checkbox":
-                properties[header] = {"checkbox": cell_value.upper() == "TRUE"}
-            elif prop_type == "date" and cell_value:
-                 properties[header] = {"date": {"start": cell_value, "end": None}}
-            elif prop_type == "url" and cell_value:
-                properties[header] = {"url": cell_value}
-            elif prop_type == "email" and cell_value:
-                properties[header] = {"email": cell_value}
-            elif prop_type == "phone_number" and cell_value:
-                properties[header] = {"phone_number": cell_value}
-            # People and Relation properties are read-only from Sheets in this version
-            # as they require mapping to Notion-specific IDs.
+            try:
+                # Based on the schema, construct the correct object structure
+                if prop_type == "title":
+                    properties[header] = {"title": [{"text": {"content": cell_value[:2000]}}]}  # Notion title limit
+                elif prop_type == "rich_text":
+                    properties[header] = {"rich_text": [{"text": {"content": cell_value[:2000]}}]}  # Notion text limit
+                elif prop_type == "number" and cell_value:
+                    try:
+                        # Handle different number formats
+                        clean_value = cell_value.replace(',', '').replace('$', '').strip()
+                        properties[header] = {"number": float(clean_value)}
+                    except ValueError:
+                        logger.warning(f"Invalid number format for {header}: {cell_value}")
+                        continue
+                elif prop_type == "select" and cell_value:
+                    # Validate against available options
+                    available_options = [opt['name'] for opt in prop_schema.get('select', {}).get('options', [])]
+                    if not available_options or cell_value in available_options:
+                        properties[header] = {"select": {"name": cell_value}}
+                elif prop_type == "status" and cell_value:
+                    properties[header] = {"status": {"name": cell_value}}
+                elif prop_type == "multi_select":
+                    names = [name.strip() for name in cell_value.split(',') if name.strip()]
+                    if names:
+                        properties[header] = {"multi_select": [{"name": name} for name in names]}
+                elif prop_type == "checkbox":
+                    properties[header] = {"checkbox": cell_value.upper() in ["TRUE", "YES", "1", "✓"]}
+                elif prop_type == "date" and cell_value:
+                    # Basic date validation (assumes YYYY-MM-DD format)
+                    if len(cell_value) >= 10 and cell_value[4] == '-' and cell_value[7] == '-':
+                        properties[header] = {"date": {"start": cell_value[:10]}}
+                elif prop_type == "url" and cell_value:
+                    if cell_value.startswith(('http://', 'https://')):
+                        properties[header] = {"url": cell_value}
+                elif prop_type == "email" and cell_value:
+                    if '@' in cell_value:  # Basic email validation
+                        properties[header] = {"email": cell_value}
+                elif prop_type == "phone_number" and cell_value:
+                    properties[header] = {"phone_number": cell_value}
+                    
+            except Exception as e:
+                logger.warning(f"Error processing property {header} with value {cell_value}: {e}")
+                continue
 
         return properties
+
+    def get_sync_summary(self):
+        """Returns a summary of the last sync operation."""
+        return f"Created: {self.sync_stats['created']}, Updated: {self.sync_stats['updated']}, Errors: {self.sync_stats['errors']}"
 
 # --- FLET APPLICATION ---
 
@@ -274,29 +358,43 @@ def main(page: ft.Page):
     page.vertical_alignment = ft.MainAxisAlignment.CENTER
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     page.theme_mode = ft.ThemeMode.LIGHT
+    page.window_width = 600
+    page.window_height = 700
 
     # --- UI State ---
     sync_in_progress = ft.Ref[ft.Text]()
+    progress_text = ft.Ref[ft.Text]()
     n2s_button = ft.Ref[ft.ElevatedButton]()
     s2n_button = ft.Ref[ft.ElevatedButton]()
     config_status = ft.Ref[ft.Text]()
+    last_sync_info = ft.Ref[ft.Text]()
+
+    def update_progress(message: str):
+        """Updates the progress text in the UI."""
+        if progress_text.current:
+            progress_text.current.value = message
+            page.update()
 
     def set_ui_locking(is_locked: bool):
         """Disables buttons and shows progress text to prevent multiple runs."""
         n2s_button.current.disabled = is_locked
         s2n_button.current.disabled = is_locked
         sync_in_progress.current.visible = is_locked
+        progress_text.current.visible = is_locked
         page.update()
         
     def notion_to_sheets_task():
         """The actual sync task that runs in a separate thread."""
         set_ui_locking(True)
         try:
-            sync_tool = Sync2Sheets()
+            sync_tool = Sync2Sheets(progress_callback=update_progress)
             sync_tool.sync_notion_to_sheets()
-            show_snackbar(page, "Successfully synced Notion to Google Sheets!", ft.Colors.GREEN)
+            summary = sync_tool.get_sync_summary()
+            show_snackbar(page, f"✅ Notion → Sheets sync complete! {summary}", ft.Colors.GREEN)
+            last_sync_info.current.value = f"Last sync: {datetime.now().strftime('%Y-%m-%d %H:%M')} - {summary}"
         except Exception as e:
-            show_snackbar(page, f"Error: {e}", ft.Colors.RED)
+            show_snackbar(page, f"❌ Error: {str(e)[:100]}...", ft.Colors.RED)
+            logger.error(f"Notion to Sheets sync error: {e}")
         finally:
             set_ui_locking(False)
             
@@ -304,39 +402,62 @@ def main(page: ft.Page):
         """The actual sync task that runs in a separate thread."""
         set_ui_locking(True)
         try:
-            sync_tool = Sync2Sheets()
+            sync_tool = Sync2Sheets(progress_callback=update_progress)
             sync_tool.sync_sheets_to_notion()
-            show_snackbar(page, "Successfully synced Google Sheets to Notion!", ft.Colors.GREEN)
+            summary = sync_tool.get_sync_summary()
+            show_snackbar(page, f"✅ Sheets → Notion sync complete! {summary}", ft.Colors.GREEN)
+            last_sync_info.current.value = f"Last sync: {datetime.now().strftime('%Y-%m-%d %H:%M')} - {summary}"
         except Exception as e:
-            show_snackbar(page, f"Error: {e}", ft.Colors.RED)
+            show_snackbar(page, f"❌ Error: {str(e)[:100]}...", ft.Colors.RED)
+            logger.error(f"Sheets to Notion sync error: {e}")
         finally:
             set_ui_locking(False)
 
     def handle_notion_to_sheets_click(e):
-        # Run the sync in a new thread to avoid freezing the UI
-        threading.Thread(target=notion_to_sheets_task).start()
+        threading.Thread(target=notion_to_sheets_task, daemon=True).start()
 
     def handle_sheets_to_notion_click(e):
-        # Run the sync in a new thread to avoid freezing the UI
-        threading.Thread(target=sheets_to_notion_task).start()
+        threading.Thread(target=sheets_to_notion_task, daemon=True).start()
 
     # Verify configuration
     config_status_text = "✅ Configuration loaded successfully"
+    config_color = ft.Colors.GREEN
+    buttons_disabled = False
+    
     if not all([NOTION_API_KEY, NOTION_DB_ID]):
         config_status_text = "⚠️ Missing Notion configuration in config.json"
+        config_color = ft.Colors.ORANGE
+        buttons_disabled = True
     elif not os.path.exists(GOOGLE_CREDENTIALS_FILE):
         config_status_text = f"⚠️ Google credentials file not found: {GOOGLE_CREDENTIALS_FILE}"
+        config_color = ft.Colors.ORANGE
+        buttons_disabled = True
 
     page.add(
         ft.Column(
             [
                 ft.Text("Notion ↔ Google Sheets Sync", size=32, weight=ft.FontWeight.BOLD),
-                ft.Text(ref=config_status, value=config_status_text, size=14, 
-                        color=ft.Colors.GREEN if "✅" in config_status_text else ft.Colors.ORANGE),
-                ft.Text(f"Syncing database: {NOTION_DB_ID}", size=12, color=ft.Colors.GREY),
-                ft.Text(f"Spreadsheet: {SPREADSHEET_NAME}", size=12, color=ft.Colors.GREY),
+                ft.Text(ref=config_status, value=config_status_text, size=14, color=config_color),
+                
+                ft.Card(
+                    content=ft.Container(
+                        content=ft.Column([
+                            ft.Text("Configuration Details", weight=ft.FontWeight.BOLD, size=16),
+                            ft.Text(f"Database ID: {NOTION_DB_ID[:8]}...", size=12, color=ft.Colors.GREY),
+                            ft.Text(f"Spreadsheet: {SPREADSHEET_NAME}", size=12, color=ft.Colors.GREY),
+                            ft.Text(f"ID Column: {NOTION_ID_COLUMN}", size=12, color=ft.Colors.BLUE_GREY),
+                        ]),
+                        padding=15,
+                    ),
+                    elevation=2,
+                ),
+                
                 ft.Divider(),
-                ft.Text(ref=sync_in_progress, value="Sync in progress, please wait...", visible=False, color=ft.Colors.BLUE),
+                
+                ft.Text(ref=sync_in_progress, value="🔄 Sync in progress, please wait...", 
+                       visible=False, color=ft.Colors.BLUE, weight=ft.FontWeight.BOLD),
+                ft.Text(ref=progress_text, value="", visible=False, color=ft.Colors.BLUE_GREY, size=12),
+                
                 ft.Row(
                     [
                         ft.ElevatedButton(
@@ -345,7 +466,12 @@ def main(page: ft.Page):
                             icon=ft.Icons.ARROW_DOWNWARD,
                             on_click=handle_notion_to_sheets_click,
                             width=250,
-                            disabled="⚠️" in config_status_text
+                            height=50,
+                            disabled=buttons_disabled,
+                            style=ft.ButtonStyle(
+                                color=ft.Colors.WHITE,
+                                bgcolor=ft.Colors.BLUE,
+                            )
                         ),
                         ft.ElevatedButton(
                             ref=s2n_button,
@@ -353,18 +479,37 @@ def main(page: ft.Page):
                             icon=ft.Icons.ARROW_UPWARD,
                             on_click=handle_sheets_to_notion_click,
                             width=250,
-                            disabled="⚠️" in config_status_text
+                            height=50,
+                            disabled=buttons_disabled,
+                            style=ft.ButtonStyle(
+                                color=ft.Colors.WHITE,
+                                bgcolor=ft.Colors.GREEN,
+                            )
                         ),
                     ],
                     alignment=ft.MainAxisAlignment.CENTER,
+                    spacing=20,
                 ),
-                ft.Text("Note: The first row in your sheet must match Notion property names", 
-                        size=12, color=ft.Colors.GREY_600, italic=True),
-                ft.Text(f"Notion ID Column: {NOTION_ID_COLUMN}", 
-                        size=12, color=ft.Colors.BLUE_GREY),
+                
+                ft.Card(
+                    content=ft.Container(
+                        content=ft.Column([
+                            ft.Text("📋 Usage Notes", weight=ft.FontWeight.BOLD, size=14),
+                            ft.Text("• First row in your sheet must match Notion property names", size=11),
+                            ft.Text("• New pages created in Notion will get their ID written back to the sheet", size=11),
+                            ft.Text("• Large datasets may take several minutes to sync", size=11),
+                            ft.Text("• Check the logs for detailed error information", size=11),
+                        ]),
+                        padding=10,
+                    ),
+                    elevation=1,
+                ),
+                
+                ft.Text(ref=last_sync_info, value="No recent sync operations", 
+                       size=12, color=ft.Colors.GREY_600, italic=True),
             ],
             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=20,
+            spacing=15,
         )
     )
 
