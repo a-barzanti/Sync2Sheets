@@ -1,0 +1,11 @@
+[project]
+name = "Sync2Sheets"
+version = "0.1.0"
+description = "Sync2Sheets is a Python application that synchronizes data between Google Sheets and Notion."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "flet[all]==0.28.3",
+    "google-auth>=2.40.2",
+    "gspread>=6.2.1",
+]
