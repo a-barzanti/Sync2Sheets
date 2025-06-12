@@ -15,7 +15,7 @@ Easily synchronize data between a Notion database and a Google Sheet using a Fle
 
 ---
 
-## 🧩 Project Structure
+## 🤩 Project Structure
 
 ```
 .
@@ -23,20 +23,32 @@ Easily synchronize data between a Notion database and a Google Sheet using a Fle
 ├── sync.py         # Sync logic (Notion ↔ Sheets)
 ├── config.py       # Configuration & secrets
 ├── config.json     # User-defined settings (Not committed)
-├── creds.json      # Google Service Account credentials
+├── creds.json      # Google Service Account credentials (Not committed)
+├── Makefile        # Run and manage the project
 ```
 
 ---
 
 ## 🔧 Setup Instructions
 
-### 1. Install Requirements
+### 1. Clone & Create Virtual Environment
+
+This projects uses uv as package manager,
+Make sure you have `uv` installed (`pip install uv`),
+otherwise this will just be a sad moment in your life.
 
 ```bash
-pip install flet gspread google-auth requests
+make venv
 ```
 
-### 2. Create `config.json`
+### 2. Install Dependencies
+
+```bash
+source .venv/bin/activate
+make install
+```
+
+### 3. Create `config.json`
 
 ```json
 {
@@ -52,18 +64,24 @@ pip install flet gspread google-auth requests
 }
 ```
 
-### 3. Get Google Service Account Credentials
+### 4. Get Google Service Account Credentials
 
 - Create a service account in Google Cloud Console
 - Share your Google Sheet with the service account email
-- Save credentials as `creds.json` in the root directory
+- Save the credentials as `creds.json` in the root directory
 
 ---
 
 ## ▶️ Run the App
 
 ```bash
-python main.py
+make start
+```
+
+Or if you like doing things the long, inefficient way:
+
+```bash
+flet run main.py
 ```
 
 ---
@@ -82,6 +100,33 @@ python main.py
 - Timestamp-based conflict resolution
 - CLI version
 - Web-deployable version via Flet cloud
+
+---
+
+## 📚 Makefile Usage
+
+```bash
+make help
+```
+
+This will show you all the available make commands:
+
+- `make venv` — Create a virtual environment using `uv`
+- `make install` — Sync dependencies from `pyproject.toml`
+- `make start` — Launch the app
+- `make clean` — Delete `.venv`, caches, and other junk
+
+Don't forget to activate the virtual environment:
+
+```bash
+source .venv/bin/activate
+```
+
+To deactivate:
+
+```bash
+deactivate
+```
 
 ---
 
